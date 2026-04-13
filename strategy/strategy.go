@@ -19,16 +19,20 @@ package strategy
 // 实盘与 Pine Script 的映射关系：
 //   - 信号 K 线 = n-2（刚收盘的 K 线）
 //   - 开仓时使用信号 K 线的 ATR 设置 SL/TP/Trail（对应 Pine 的 strategy.exit 在信号 K 线收盘时设置）
-//   - 追踪止损由 watchPositions 每 30 秒用 1H K 线调用 checkTrailOnBar 驱动（不使用币安 TRAILING_STOP_MARKET）
+//   - 追踪止损/超时等平仓由 watchPositions 每 30 秒调用回测 API 驱动（不使用币安 TRAILING_STOP_MARKET）
+//   - 回测 API 返回完整交易列表，匹配当前持仓的入场时间+方向，若回测显示已平仓则执行市价平仓
 //   - 保本检查用信号 K 线的 close 和 ATR（对应 Pine 的 strategy.exit("BE") 在 K 线收盘时检查）
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,44 +303,14 @@ func (e *Engine) watchPositions() {
 				}
 			}
 
-			// 3. 追踪止损检查（回测 v21 逻辑，每 30 秒用当前 1H K 线的实时 OHLC）
-			//
-			// 获取最新 1H K 线（包含当前未收盘 K 线），用当前 K 线的实时 OHLC
-			// 和信号 K 线的 ATR 调用 checkTrailOnBar
-			klines, err := e.client.GetKlines(sym, "1h", 20)
-			if err != nil || len(klines) < 16 {
-				continue
-			}
-			kn := len(klines)
-			// 计算信号 K 线的 ATR
-			khighs := make([]float64, kn)
-			klows := make([]float64, kn)
-			kcloses := make([]float64, kn)
-			for i, k := range klines {
-				khighs[i] = k.High
-				klows[i] = k.Low
-				kcloses[i] = k.Close
-			}
-			atr14 := indicator.ATR(khighs, klows, kcloses, 14)
-			signalATR := atr14[kn-2] // 信号 K 线的 ATR
-			if math.IsNaN(signalATR) || signalATR == 0 {
-				signalATR = atr // fallback 到开仓时的 ATR
-			}
-
-			// 当前未收盘 K 线的实时 OHLC
-			currBar := klines[kn-1]
-			barOHLC := [4]float64{currBar.Open, currBar.High, currBar.Low, currBar.Close}
-
-			e.mu.RLock()
-			info := e.exchangeInfo[sym]
-			e.mu.RUnlock()
-
-			if trailExit := e.checkTrailOnBar(sym, snap, avgP, signalATR, barOHLC, info); trailExit {
-				web.Trade(sym, "📉 追踪止损触发（实时监控 30s），主动市价平仓")
+			// 3. 回测驱动平仓：调用回测 API，匹配当前持仓的交易，
+			//    如果回测显示该交易已平仓，则按回测的平仓原因执行市价平仓
+			if exitReason := e.checkBacktestExit(sym, snap); exitReason != "" {
+				web.Trade(sym, fmt.Sprintf("📊 回测驱动平仓：%s", exitReason))
 				_ = e.client.CancelAllOrders(sym)
 				_ = e.client.CancelAllAlgoOrders(sym)
 				if err := e.client.ClosePosition(sym, pos); err != nil {
-					web.Error(sym, fmt.Sprintf("追踪止损平仓失败: %v", err))
+					web.Error(sym, fmt.Sprintf("回测驱动平仓失败: %v", err))
 				} else {
 					state.Close()
 				}
@@ -974,6 +948,87 @@ func (e *Engine) updateExitOrders(symbol string, state *orderbook.TradeState, po
 //   - highFirst = |O-H| < |O-L|
 //
 // 返回 true 表示追踪止损触发，需要平仓
+// backtestTrade 回测交易结果结构
+type backtestTrade struct {
+	No              int     `json:"no"`
+	Side            string  `json:"side"`
+	EntryTimeUTC8   string  `json:"entry_time_utc8"`
+	TVEntryTimeUTC8 string  `json:"tv_entry_time_utc8"`
+	EntryPrice      float64 `json:"entry_price"`
+	ExitTimeUTC8    string  `json:"exit_time_utc8"`
+	TVExitTimeUTC8  string  `json:"tv_exit_time_utc8"`
+	ExitPrice       float64 `json:"exit_price"`
+	ExitReason      string  `json:"exit_reason"`
+	BarsHeld        int     `json:"bars_held"`
+	PnlUSDT         float64 `json:"pnl_usdt"`
+}
+
+type backtestResult struct {
+	Symbol string           `json:"symbol"`
+	Trades []backtestTrade  `json:"trades"`
+}
+
+// checkBacktestExit 调用回测 API，匹配当前持仓的交易，
+// 如果回测显示该交易已平仓，返回平仓原因；否则返回空字符串
+func (e *Engine) checkBacktestExit(symbol string, snap orderbook.Snapshot) string {
+	// 调用本地回测 API
+	url := fmt.Sprintf("http://127.0.0.1:%s/api/backtest?symbol=%s", e.cfg.WebPort, symbol)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		web.Warn(symbol, fmt.Sprintf("回测 API 调用失败: %v", err))
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		web.Warn(symbol, fmt.Sprintf("回测 API 读取失败: %v", err))
+		return ""
+	}
+
+	var result backtestResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		web.Warn(symbol, fmt.Sprintf("回测 API 解析失败: %v", err))
+		return ""
+	}
+
+	// 将实盘开仓时间转换为 UTC+8 格式（与回测 entry_time_utc8 匹配）
+	// EntryBarTime 是 UTC 整点，转 UTC+8 需要 +8h
+	entryBarUTC8 := snap.EntryBarTime.Add(8 * time.Hour).Format("2006-01-02 15:04")
+
+	// 在回测结果中查找匹配的交易
+	for _, trade := range result.Trades {
+		// 匹配条件：入场时间一致 且 方向一致
+		if trade.EntryTimeUTC8 == entryBarUTC8 && strings.EqualFold(trade.Side, snap.Side) {
+			// 找到匹配的交易
+			if trade.ExitTimeUTC8 != "" {
+				// 回测显示该交易已平仓
+				web.Info(symbol, fmt.Sprintf(
+					"回测匹配 #%d: %s 入场=%s 出场=%s 价格=%.4f 原因=%s PnL=%.2f",
+					trade.No, trade.Side, trade.EntryTimeUTC8, trade.ExitTimeUTC8,
+					trade.ExitPrice, trade.ExitReason, trade.PnlUSDT,
+				))
+				return fmt.Sprintf("%s | 回测#%d 出场价=%.4f PnL=%.2f",
+					trade.ExitReason, trade.No, trade.ExitPrice, trade.PnlUSDT)
+			}
+			// 匹配到但还未平仓，正常
+			web.Info(symbol, fmt.Sprintf(
+				"回测匹配 #%d: %s 入场=%s 尚未平仓（持仓 %d 根K线）",
+				trade.No, trade.Side, trade.EntryTimeUTC8, trade.BarsHeld,
+			))
+			return ""
+		}
+	}
+
+	// 未找到匹配的交易（可能开仓时间不在回测范围内）
+	web.Warn(symbol, fmt.Sprintf(
+		"回测未匹配: %s 入场时间=%s 方向=%s（共 %d 笔交易）",
+		symbol, entryBarUTC8, snap.Side, len(result.Trades),
+	))
+	return ""
+}
+
 func (e *Engine) checkTrailOnBar(symbol string, snap orderbook.Snapshot, avgP, atr float64, barOHLC [4]float64, info *exchange.ExchangeInfo) bool {
 	o, h, l, c := barOHLC[0], barOHLC[1], barOHLC[2], barOHLC[3]
 

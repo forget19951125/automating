@@ -25,6 +25,9 @@ type TradeState struct {
 	BreakevenActivated bool
 	BESLPrice          float64 // 保本止损价（avgP ± ATR×0.2）
 
+	// 开仓 K 线的整点时间（用于回测匹配）
+	EntryBarTime time.Time
+
 	// 当前 ATR（开仓时记录）
 	EntryATR float64
 
@@ -57,6 +60,8 @@ func (ts *TradeState) Open(side string, price, qty, atr float64, barIdx int) {
 	ts.EntryPrice = price
 	ts.EntryTime = time.Now()
 	ts.EntryBarIdx = barIdx
+	// 记录开仓 K 线的整点时间（当前时间截断到小时），用于回测匹配
+	ts.EntryBarTime = time.Now().UTC().Truncate(time.Hour)
 	ts.CurrentBarIdx = barIdx
 	ts.Qty = qty
 	ts.EntryATR = atr
@@ -145,6 +150,7 @@ type Snapshot struct {
 	Side               string    `json:"side"`
 	EntryPrice         float64   `json:"entry_price"`
 	EntryTime          time.Time `json:"entry_time"`
+	EntryBarTime       time.Time `json:"entry_bar_time"`
 	Qty                float64   `json:"qty"`
 	BarsHeld           int       `json:"bars_held"`
 	EntryATR           float64   `json:"entry_atr"`
@@ -168,6 +174,7 @@ func (ts *TradeState) GetSnapshot() Snapshot {
 		Side:               ts.Side,
 		EntryPrice:         ts.EntryPrice,
 		EntryTime:          ts.EntryTime,
+		EntryBarTime:       ts.EntryBarTime,
 		Qty:                ts.Qty,
 		BarsHeld:           barsHeld,
 		EntryATR:           ts.EntryATR,
