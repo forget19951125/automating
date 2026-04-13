@@ -9,17 +9,17 @@ binance_bot_new
 binance_bot_eth_new
 binance_bot_eth_backup_*
 binance_bot_eth.bak*
-backtest
-backtest_bin
-backtest_bin_backup_*
-backtest_btc
-backtest_eth
-backtest_eth_orig
-backtest_eth_v2
-backtest_eth_v3
-backtest_sol
-backtest_dbg
-backtest_v21
+/backtest
+/backtest_bin
+/backtest_bin_backup_*
+/backtest_btc
+/backtest_eth
+/backtest_eth_orig
+/backtest_eth_v2
+/backtest_eth_v3
+/backtest_sol
+/backtest_dbg
+/backtest_v21
 build/
 
 # Backup files
