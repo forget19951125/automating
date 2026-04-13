@@ -19,7 +19,7 @@ package strategy
 // 实盘与 Pine Script 的映射关系：
 //   - 信号 K 线 = n-2（刚收盘的 K 线）
 //   - 开仓时使用信号 K 线的 ATR 设置 SL/TP/Trail（对应 Pine 的 strategy.exit 在信号 K 线收盘时设置）
-//   - 追踪止损只在开仓时挂一次（币安 TRAILING_STOP_MARKET 由交易所管理激活状态）
+//   - 追踪止损由 watchPositions 每 30 秒用 1H K 线调用 checkTrailOnBar 驱动（不使用币安 TRAILING_STOP_MARKET）
 //   - 保本检查用信号 K 线的 close 和 ATR（对应 Pine 的 strategy.exit("BE") 在 K 线收盘时检查）
 
 import (
@@ -201,7 +201,7 @@ func (e *Engine) Start() {
 // 保本触发时：只取消旧止损单，挂新的保本止损单
 // 保留止盈单和追踪止损单（对应 Pine Script: strategy.exit("BE") 只覆盖 stop）
 func (e *Engine) watchPositions() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for e.running.Load() {
@@ -235,72 +235,111 @@ func (e *Engine) watchPositions() {
 				continue
 			}
 			if pos.Side == "NONE" && state.IsOpen() {
-				web.Trade(sym, fmt.Sprintf("实时监控：检测到持仓已平仓，取消残留挂单"))
+				web.Trade(sym, "实时监控：检测到持仓已平仓，取消残留挂单")
 				state.Close()
 				_ = e.client.CancelAllOrders(sym)
 				_ = e.client.CancelAllAlgoOrders(sym)
 				continue
 			}
 
-			// 2. 检测保本条件（实时价格 K 线内触发）
 			snap := state.GetSnapshot()
-			if snap.BreakevenActivated {
-				continue
-			}
 			atr := snap.EntryATR
 			if atr == 0 {
 				continue
 			}
 			avgP := snap.EntryPrice
 
-			var beTriggered bool
-			var newStopPrice float64
-			if snap.Side == "LONG" && price > avgP+atr*1.5 {
-				newStopPrice = avgP + atr*0.2
-				beTriggered = true
-			} else if snap.Side == "SHORT" && price < avgP-atr*1.5 {
-				newStopPrice = avgP - atr*0.2
-				beTriggered = true
+			// 2. 检测保本条件（实时价格 K 线内触发）
+			if !snap.BreakevenActivated {
+				var beTriggered bool
+				var newStopPrice float64
+				if snap.Side == "LONG" && price > avgP+atr*1.5 {
+					newStopPrice = avgP + atr*0.2
+					beTriggered = true
+				} else if snap.Side == "SHORT" && price < avgP-atr*1.5 {
+					newStopPrice = avgP - atr*0.2
+					beTriggered = true
+				}
+
+				if beTriggered {
+					web.Trade(sym, fmt.Sprintf(
+						"🔒 实时保本触发！实时价=%.4f | 条件: avgP±ATR×1.5=%.4f | 新止损=%.4f",
+						price, avgP+atr*1.5, newStopPrice,
+					))
+
+					e.mu.RLock()
+					info := e.exchangeInfo[sym]
+					e.mu.RUnlock()
+					if info != nil {
+						newStopPrice = exchange.RoundToTick(newStopPrice, info.TickSize)
+					}
+
+					oldStopID := snap.StopOrderID
+					if oldStopID != 0 {
+						_ = e.client.CancelAlgoOrder(oldStopID)
+					}
+
+					var stopSide futures.SideType
+					if snap.Side == "LONG" {
+						stopSide = futures.SideTypeSell
+					} else {
+						stopSide = futures.SideTypeBuy
+					}
+
+					stopID, err := e.client.PlaceStopOrder(sym, stopSide, pos.Qty, newStopPrice)
+					if err != nil {
+						web.Error(sym, fmt.Sprintf("实时保本止损单失败: %v", err))
+					} else {
+						state.SetStopOrder(stopID)
+						state.SetBreakeven()
+						state.SetBESLPrice(newStopPrice)
+						web.Trade(sym, fmt.Sprintf("✅ 实时保本止损单 ID=%d 价格=%.4f", stopID, newStopPrice))
+					}
+					continue // 保本触发后跳过追踪止损检查
+				}
 			}
 
-			if !beTriggered {
+			// 3. 追踪止损检查（回测 v21 逻辑，每 30 秒用当前 1H K 线的实时 OHLC）
+			//
+			// 获取最新 1H K 线（包含当前未收盘 K 线），用当前 K 线的实时 OHLC
+			// 和信号 K 线的 ATR 调用 checkTrailOnBar
+			klines, err := e.client.GetKlines(sym, "1h", 20)
+			if err != nil || len(klines) < 16 {
 				continue
 			}
+			kn := len(klines)
+			// 计算信号 K 线的 ATR
+			khighs := make([]float64, kn)
+			klows := make([]float64, kn)
+			kcloses := make([]float64, kn)
+			for i, k := range klines {
+				khighs[i] = k.High
+				klows[i] = k.Low
+				kcloses[i] = k.Close
+			}
+			atr14 := indicator.ATR(khighs, klows, kcloses, 14)
+			signalATR := atr14[kn-2] // 信号 K 线的 ATR
+			if math.IsNaN(signalATR) || signalATR == 0 {
+				signalATR = atr // fallback 到开仓时的 ATR
+			}
 
-			web.Trade(sym, fmt.Sprintf(
-				"🔒 实时保本触发！实时价=%.4f | 条件: avgP±ATR×1.5=%.4f | 新止损=%.4f",
-				price, avgP+atr*1.5, newStopPrice,
-			))
+			// 当前未收盘 K 线的实时 OHLC
+			currBar := klines[kn-1]
+			barOHLC := [4]float64{currBar.Open, currBar.High, currBar.Low, currBar.Close}
 
 			e.mu.RLock()
 			info := e.exchangeInfo[sym]
 			e.mu.RUnlock()
-			if info != nil {
-				newStopPrice = exchange.RoundToTick(newStopPrice, info.TickSize)
-			}
 
-			// 只取消旧止损单（保留止盈单和追踪止损单）
-			// Pine Script: strategy.exit("BE") 只覆盖 stop，不影响 limit 和 trail
-			oldStopID := snap.StopOrderID
-			if oldStopID != 0 {
-				_ = e.client.CancelAlgoOrder(oldStopID)
-			}
-
-			var stopSide futures.SideType
-			if snap.Side == "LONG" {
-				stopSide = futures.SideTypeSell
-			} else {
-				stopSide = futures.SideTypeBuy
-			}
-
-			stopID, err := e.client.PlaceStopOrder(sym, stopSide, pos.Qty, newStopPrice)
-			if err != nil {
-				web.Error(sym, fmt.Sprintf("实时保本止损单失败: %v", err))
-			} else {
-				state.SetStopOrder(stopID)
-				state.SetBreakeven()
-				state.SetBESLPrice(newStopPrice)
-				web.Trade(sym, fmt.Sprintf("✅ 实时保本止损单 ID=%d 价格=%.4f", stopID, newStopPrice))
+			if trailExit := e.checkTrailOnBar(sym, snap, avgP, signalATR, barOHLC, info); trailExit {
+				web.Trade(sym, "📉 追踪止损触发（实时监控 30s），主动市价平仓")
+				_ = e.client.CancelAllOrders(sym)
+				_ = e.client.CancelAllAlgoOrders(sym)
+				if err := e.client.ClosePosition(sym, pos); err != nil {
+					web.Error(sym, fmt.Sprintf("追踪止损平仓失败: %v", err))
+				} else {
+					state.Close()
+				}
 			}
 		}
 	}
@@ -635,7 +674,7 @@ func (e *Engine) syncPosition(symbol string, pos *exchange.Position, state *orde
 //   - 追踪止损每根 K 线重新计算（fresh trail，对应 Pine Script strategy.exit 每根 K 线替换订单）
 //   - 用 OHLC 4 点模型检查追踪止损激活和触发
 //   - 如果追踪止损触发，主动市价平仓
-//   - 保留币安 TRAILING_STOP_MARKET 作为 K 线内安全网
+//   - 追踪止损由 watchPositions 每 30 秒调用 checkTrailOnBar 驱动（不使用币安 TRAILING_STOP_MARKET）
 func (e *Engine) handleExit(symbol string, state *orderbook.TradeState, pos *exchange.Position, currentClose, currentATR float64, barOHLC [4]float64) {
 	snap := state.GetSnapshot()
 	avgP := snap.EntryPrice
@@ -910,50 +949,18 @@ func (e *Engine) updateExitOrders(symbol string, state *orderbook.TradeState, po
 		}
 	}
 
-	// 更新追踪止损单（对齐回测 v21: 每根 K 线用最新 ATR 重新计算参数）
-	// 保留币安 TRAILING_STOP_MARKET 作为 K 线内安全网
-	// 每根 K 线取消旧单重挂新单（用最新 ATR 计算参数）
-	if !snap.BreakevenActivated {
-		mintick := 0.01
-		if info != nil && info.TickSize > 0 {
-			mintick = info.TickSize
-		}
-		activateDist := atr * 10.0 * mintick
-		trailDist := atr * 3.0 * mintick
-
-		var activationPrice float64
-		if snap.Side == "LONG" {
-			activationPrice = avgP + activateDist
-		} else {
-			activationPrice = avgP - activateDist
-		}
-		if info != nil {
-			activationPrice = exchange.RoundToTick(activationPrice, info.TickSize)
-		}
-		callbackRate := trailDist / avgP * 100
-		callbackRate = math.Max(0.1, math.Min(5.0, callbackRate))
-
-		// 取消旧的追踪止损单（如果存在）
-		if hasTrail {
-			for _, o := range orders {
-				if string(o.Type) == "TRAILING_STOP_MARKET" {
-					if err := e.client.CancelAlgoOrder(o.OrderID); err != nil {
-						web.Warn(symbol, fmt.Sprintf("取消旧追踪止损单失败: %v", err))
-					}
+	// 追踪止损不再使用币安 TRAILING_STOP_MARKET
+	// 由 watchPositions 每 30 秒调用 checkTrailOnBar（回测 v21 逻辑）驱动
+	// 清理可能残留的追踪止损单
+	if hasTrail {
+		for _, o := range orders {
+			if string(o.Type) == "TRAILING_STOP_MARKET" {
+				if err := e.client.CancelAlgoOrder(o.OrderID); err != nil {
+					web.Warn(symbol, fmt.Sprintf("取消残留追踪止损单失败: %v", err))
+				} else {
+					web.Info(symbol, "已取消残留的币安追踪止损单")
 				}
 			}
-		}
-
-		// 用最新 ATR 重新挂追踪止损单
-		trailID, err := e.client.PlaceTrailingStopOrderWithActivation(
-			symbol, exitSide, pos.Qty, activationPrice, callbackRate,
-		)
-		if err != nil {
-			web.Warn(symbol, fmt.Sprintf("更新追踪止损单失败: %v", err))
-		} else {
-			state.SetTrailOrder(trailID)
-			web.Info(symbol, fmt.Sprintf("🔄 更新追踪止损单 ID=%d 激活价=%.4f 回调率=%.4f%%",
-				trailID, activationPrice, callbackRate))
 		}
 	}
 }
@@ -1432,45 +1439,10 @@ func (e *Engine) placeExitOrders(symbol string, state *orderbook.TradeState,
 		web.Trade(symbol, fmt.Sprintf("✅ 止盈单 ID=%d 价格=%.4f", tpID, tpPrice))
 	}
 
-	// 追踪止损（对应 Pine Script: trail_points=atr*10, trail_offset=atr*3）
-	//
-	// trail_points 和 trail_offset 的单位是 ticks
-	// 实际价格距离 = ticks * mintick
-	//
-	// 激活价格 = 开仓价 ± ATR×10×mintick（基于开仓价！不是 currentClose！）
-	// 回撤距离 = ATR×3×mintick
-	// callbackRate = 回撤距离 / 价格 × 100
-	mintick := 0.01 // 默认 ETH
-	if info != nil && info.TickSize > 0 {
-		mintick = info.TickSize
-	}
-
-	activateDist := atr * 10.0 * mintick
-	trailDist := atr * 3.0 * mintick
-
-	var activationPrice float64
-	if side == "LONG" {
-		activationPrice = price + activateDist // 开仓价 + ATR×10×mintick
-	} else {
-		activationPrice = price - activateDist // 开仓价 - ATR×10×mintick
-	}
-	if info != nil {
-		activationPrice = exchange.RoundToTick(activationPrice, info.TickSize)
-	}
-
-	callbackRate := trailDist / price * 100
-	callbackRate = math.Max(0.1, math.Min(5.0, callbackRate))
-
-	trailID, err := e.client.PlaceTrailingStopOrderWithActivation(symbol, exitSide, qty, activationPrice, callbackRate)
-	if err != nil {
-		web.Warn(symbol, fmt.Sprintf("追踪止损单失败（非致命）: %v", err))
-		trailID = 0
-	} else {
-		web.Trade(symbol, fmt.Sprintf(
-			"✅ 追踪止损单 ID=%d 激活价=%.4f 回调率=%.4f%%（mintick=%.8f ATR=%.4f）",
-			trailID, activationPrice, callbackRate, mintick, atr,
-		))
-	}
+	// 追踪止损不再使用币安 TRAILING_STOP_MARKET（callbackRate 最小 0.1% 导致过早触发）
+	// 改为由 watchPositions 每 30 秒调用 checkTrailOnBar（回测 v21 逻辑）驱动
+	var trailID int64 = 0
+	web.Info(symbol, "追踪止损由 checkTrailOnBar（回测 v21 逻辑）驱动，不挂币安 TRAILING_STOP_MARKET")
 
 	state.SetOrders(stopID, tpID, trailID)
 }
