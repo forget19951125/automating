@@ -1,0 +1,45 @@
+# Environment and secrets
+.env
+
+# Binary files
+binance_bot
+binance_bot_eth
+binance_bot_test
+binance_bot_new
+binance_bot_eth_new
+binance_bot_eth_backup_*
+binance_bot_eth.bak*
+backtest
+backtest_bin
+backtest_bin_backup_*
+backtest_btc
+backtest_eth
+backtest_eth_orig
+backtest_eth_v2
+backtest_eth_v3
+backtest_sol
+backtest_dbg
+backtest_v21
+build/
+
+# Backup files
+*.bak
+*.bak2
+*.bak3
+*.bak_pre_v21
+*.bak_v18
+*.old
+
+# Data files (runtime state)
+data/high_equity.json
+data/high_equity.json.bak
+
+# Logs
+bot.log
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
